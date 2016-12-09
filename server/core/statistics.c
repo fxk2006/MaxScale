@@ -31,7 +31,20 @@
 #include <maxscale/platform.h>
 
 static int thread_count = 0;
+static size_t cache_linesize = 0;
+static size_t stats_size = 0;
 static bool stats_initialized = false;
+
+static size_t get_cache_line_size()
+{
+    size_t rval = 64; // Cache lines are 64 bytes for x86
+
+#ifdef _SC_LEVEL1_DCACHE_LINESIZE
+    rval = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+#endif
+
+    return rval;
+}
 
 /**
  * @brief Initialize the statistics gathering
@@ -40,6 +53,8 @@ void ts_stats_init()
 {
     ss_dassert(!stats_initialized);
     thread_count = config_threadcount();
+    cache_linesize = get_cache_line_size();
+    stats_size = thread_count * cache_linesize;
     stats_initialized = true;
 }
 
@@ -59,7 +74,7 @@ void ts_stats_end()
 ts_stats_t ts_stats_alloc()
 {
     ss_dassert(stats_initialized);
-    return MXS_CALLOC(thread_count, sizeof(int64_t));
+    return MXS_CALLOC(thread_count, cache_linesize);
 }
 
 /**
@@ -85,10 +100,12 @@ int64_t ts_stats_sum(ts_stats_t stats)
 {
     ss_dassert(stats_initialized);
     int64_t sum = 0;
-    for (int i = 0; i < thread_count; i++)
+
+    for (size_t i = 0; i < stats_size; i += cache_linesize)
     {
-        sum += ((int64_t*)stats)[i];
+        sum += *((int64_t*)stats + i);
     }
+
     return sum;
 }
 
@@ -106,9 +123,9 @@ int64_t ts_stats_get(ts_stats_t stats, enum ts_stats_type type)
     ss_dassert(stats_initialized);
     int64_t best = type == TS_STATS_MAX ? LONG_MIN : (type == TS_STATS_MIX ? LONG_MAX : 0);
 
-    for (int i = 0; i < thread_count; i++)
+    for (size_t i = 0; i < stats_size; i += cache_linesize)
     {
-        int64_t value = ((int64_t*)stats)[i];
+        int64_t value = *((int64_t*)(stats + i));
 
         switch (type)
         {
@@ -134,4 +151,40 @@ int64_t ts_stats_get(ts_stats_t stats, enum ts_stats_type type)
     }
 
     return type == TS_STATS_AVG ? best / thread_count : best;
+}
+
+void ts_stats_increment(ts_stats_t stats, int thread_id)
+{
+    ss_dassert(thread_id < thread_count);
+    int64_t *item = (int64_t*)(stats + (thread_id * cache_linesize));
+    *item += 1;
+}
+
+void ts_stats_set(ts_stats_t stats, int value, int thread_id)
+{
+    ss_dassert(thread_id < thread_count);
+    int64_t *item = (int64_t*)(stats + (thread_id * cache_linesize));
+    *item = value;
+}
+
+void ts_stats_set_max(ts_stats_t stats, int value, int thread_id)
+{
+    ss_dassert(thread_id < thread_count);
+    int64_t *item = (int64_t*)(stats + (thread_id * cache_linesize));
+
+    if (value > *item)
+    {
+        *item = value;
+    }
+}
+
+void ts_stats_set_min(ts_stats_t stats, int value, int thread_id)
+{
+    ss_dassert(thread_id < thread_count);
+    int64_t *item = (int64_t*)(stats + (thread_id * cache_linesize));
+
+    if (value < *item)
+    {
+        *item = value;
+    }
 }
